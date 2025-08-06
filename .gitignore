@@ -1,0 +1,37 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+.env
+
+# IDEs
+.VSCode/
+.idea/
+*.code-workspace
+
+# Logs
+logs/*.log
+*.log
+
+# Data files (uncomment if you don't want to track these)
+# successful_logins.json
+# failed_logins.json
+
+# Test results
+test_results.json
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
