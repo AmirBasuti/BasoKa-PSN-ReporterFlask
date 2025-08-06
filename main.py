@@ -1,60 +1,85 @@
-"""
-Flask Server for BasoKa Process Management
-Provides API endpoints for managing and monitoring a checker process via Telegram bot.
-(Simplified version without threading)
-"""
-
 import os
+import sys
 import json
 import logging
 import subprocess
+import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
+from collections import deque
+import psutil
+
 
 from flask import Flask, jsonify, request
 
+# --- Basic Setup ---
+# Determine the absolute path of the project's root directory.
+# This makes the script portable and runnable from any location.
+APP_ROOT = Path(__file__).parent.resolve()
 
-# Configure logging
+# --- Logging Configuration ---
+# Create a 'logs' directory if it doesn't exist.
+LOGS_DIR = APP_ROOT / 'logs'
+LOGS_DIR.mkdir(exist_ok=True)
+
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('logs/flask_app.log'),
+        logging.FileHandler(LOGS_DIR / 'flask_app.log'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
 
+# --- Application Configuration ---
 class Config:
-    """Application configuration"""
-    SUCCESS_FILE = Path(r"D:\Amir\Code\PNSHit\psn_hit_check\reports_json\successful_logins.json")
-    RETRY_FILE = Path(r"D:\Amir\Code\PNSHit\psn_hit_check\reports_json\retry_accounts.json")
-    FAILED_FILE = Path(r"D:\Amir\Code\PNSHit\psn_hit_check\reports_json\failed_logins.json")
-    MAIN_SCRIPT = r"D:\Amir\Code\PNSHit\psn_hit_check\main.py"
-    LOG_FILE = Path(r"D:\Amir\Code\PNSHit\psn_hit_check\logs\login_process.log")
+
+    # --- Paths for Data Files ---
+    REPORTS_DIR = APP_ROOT / 'reports_json'
+    SUCCESS_FILE = REPORTS_DIR / 'successful_logins.json'
+    RETRY_FILE = REPORTS_DIR / 'retry_accounts.json'
+    FAILED_FILE = REPORTS_DIR / 'failed_logins.json'
+
+    # --- Path for the target script to run ---
+    # This robustly points to a sibling directory of the app's folder.
+    MAIN_SCRIPT = APP_ROOT.parent / 'psn_hit_check' / 'main.py'
+
+    # --- Paths for Log Files ---
+    PROCESS_LOG_FILE = LOGS_DIR / 'login_process.log'
+    PROCESS_STDOUT_LOG = LOGS_DIR / 'process_stdout.log'
+    PROCESS_STDERR_LOG = LOGS_DIR / 'process_stderr.log'
+
+    # --- Default Values ---
     DEFAULT_RECENT_LIMIT = 10
     LOG_TAIL_LINES = 50
 
 
-class ProcessManager:
-    """Manages the checker process lifecycle without threads."""
+class ProcessStatus:
+    STARTED = "started"
+    STOPPED = "stopped"
+    RUNNING = "running"
+    ALREADY_RUNNING = "already_running"
+    NOT_RUNNING = "not_running"
+    ERROR = "error"
 
-    _process = None # Class attribute to hold the single process instance
+
+
+class ProcessManager:
+    _process: Optional[subprocess.Popen] = None
+    _lock = threading.Lock()
 
     def _cleanup_process(self):
-        """Resets process state."""
         ProcessManager._process = None
-        logger.info("Process has been cleaned up.")
+        logger.info("Process reference has been cleaned up.")
 
     def is_running(self) -> bool:
-        """Check if the process is currently running."""
         if ProcessManager._process is None:
             return False
 
-        # poll() is non-blocking. It returns None if the process is running,
-        # or the exit code if it has finished.
+        # poll() is non-blocking. It returns None if running, or an exit code if finished.
         if ProcessManager._process.poll() is not None:
             logger.info(f"Process found to be finished with exit code: {ProcessManager._process.returncode}")
             self._cleanup_process()
@@ -63,107 +88,120 @@ class ProcessManager:
         return True
 
     def start(self) -> Dict[str, Any]:
-        """Start the checker process."""
-        if self.is_running():
-            logger.warning("Attempt to start already running process")
-            return {"status": "already_running", "message": "Process is already running"}
+        with self._lock:
+            if self.is_running():
+                logger.warning("Attempted to start an already running process.")
+                return {"status": ProcessStatus.ALREADY_RUNNING, "message": "Process is already running."}
 
-        try:
-            env = os.environ.copy()
-            env.pop('SELENIUM_HEADLESS', None)
+            try:
+                if not Config.MAIN_SCRIPT.exists():
+                    error_msg = f"Main script not found at {Config.MAIN_SCRIPT}"
+                    logger.error(error_msg)
+                    return {"status": ProcessStatus.ERROR, "message": error_msg}
 
-            # Popen is non-blocking and starts the process in the background.
-            ProcessManager._process = subprocess.Popen(
-                ["uv", "run", "python", Config.MAIN_SCRIPT],
-                stdout=open('logs/process_stdout.log', 'a'),
-                stderr=open('logs/process_stderr.log', 'a'),
-                text=True,
-                env=env
-            )
+                logger.info(f"Starting process: {Config.MAIN_SCRIPT}")
 
-            pid = ProcessManager._process.pid
-            logger.info(f"Started checker process with PID: {pid}")
-            return {"status": "started", "pid": pid}
+                command = [sys.executable, str(Config.MAIN_SCRIPT)]
 
-        except Exception as e:
-            logger.error(f"Failed to start process: {e}")
-            self._cleanup_process()
-            return {"status": "error", "message": str(e)}
+                ProcessManager._process = subprocess.Popen(
+                    command,
+                    stdout=open(Config.PROCESS_STDOUT_LOG, 'a', encoding='utf-8'),
+                    stderr=open(Config.PROCESS_STDERR_LOG, 'a', encoding='utf-8'),
+                    text=True
+                )
+
+                pid = ProcessManager._process.pid
+                logger.info(f"Successfully started checker process with PID: {pid}")
+                return {"status": ProcessStatus.STARTED, "pid": pid}
+
+            except Exception as e:
+                logger.critical(f"Failed to start process: {e}", exc_info=True)
+                self._cleanup_process()
+                return {"status": ProcessStatus.ERROR, "message": f"An unexpected error occurred: {e}"}
 
     def stop(self) -> Dict[str, Any]:
-        """Stop the checker process."""
-        if not self.is_running():
-            logger.warning("Attempt to stop non-running process")
-            return {"status": "not_running", "message": "Process is not running"}
+        with self._lock:
+            if not self.is_running():
+                logger.warning("Attempted to stop a non-running process.")
+                return {"status": ProcessStatus.NOT_RUNNING, "message": "Process is not running."}
 
-        try:
-            pid = ProcessManager._process.pid
-            logger.info(f"Attempting to stop process with PID: {pid}")
+            try:
+                pid = ProcessManager._process.pid
+                logger.info(f"Attempting to terminate process tree for PID: {pid}")
 
-            # Use taskkill for a more forceful stop on Windows.
-            # check=False prevents an exception if the process is already gone.
-            result = subprocess.run(
-                ['taskkill', '/F', '/T', '/PID', str(pid)],
-                capture_output=True, text=True, check=False
-            )
+                parent = psutil.Process(pid)
+                children = parent.children(recursive=True)
 
-            # Log an error only if taskkill failed for an unexpected reason.
-            if result.returncode != 0 and "not found" not in result.stderr.lower():
-                logger.error(f"taskkill failed for PID {pid}. Stderr: {result.stderr}")
-                return {"status": "error", "message": f"taskkill failed: {result.stderr}"}
+                logger.info(f"Found {len(children)} child processes to terminate.")
 
-            self._cleanup_process()
-            logger.info(f"Successfully stopped process tree for PID {pid}.")
-            return {"status": "stopped"}
+                for child in children:
+                    try:
+                        child.terminate()
+                        logger.info(f"Terminated child process {child.pid}")
+                    except psutil.NoSuchProcess:
+                        logger.warning(f"Child process {child.pid} already gone.")
 
-        except Exception as e:
-            logger.error(f"Failed to stop process: {e}")
-            return {"status": "error", "message": str(e)}
+                gone, alive = psutil.wait_procs(children, timeout=3)
+                for p in alive:
+                    logger.warning(f"Child process {p.pid} did not terminate, killing it.")
+                    p.kill()
+
+                try:
+                    parent.terminate()
+                    logger.info(f"Terminated main process {pid}")
+                    parent.wait(timeout=5)
+                except psutil.NoSuchProcess:
+                     logger.warning(f"Main process {pid} already gone.")
+                except psutil.TimeoutExpired:
+                    logger.warning(f"Main process {pid} did not terminate, killing it.")
+                    parent.kill()
+                    parent.wait()
+
+                self._cleanup_process()
+                return {"status": ProcessStatus.STOPPED}
+
+            except psutil.NoSuchProcess:
+                logger.warning(f"Process with PID {pid} not found. It may have already finished.")
+                self._cleanup_process()
+                return {"status": ProcessStatus.STOPPED, "message": "Process was already gone."}
+            except Exception as e:
+                logger.critical(f"An error occurred while stopping process tree: {e}", exc_info=True)
+                return {"status": ProcessStatus.ERROR, "message": f"An unexpected error occurred: {e}"}
 
     def get_process_info(self) -> Dict[str, Any]:
-        """Get detailed process information."""
-        if self.is_running():
-            return {
-                "running": True,
-                "pid": ProcessManager._process.pid,
-                "status": "running"
-            }
+        with self._lock:
+            if self.is_running():
+                return {
+                    "running": True,
+                    "pid": ProcessManager._process.pid,
+                    "status": ProcessStatus.RUNNING
+                }
 
-        return {
-            "running": False,
-            "pid": None,
-            "status": "stopped"
-        }
+            return {
+                "running": False,
+                "pid": None,
+                "status": ProcessStatus.STOPPED
+            }
 
 
 class DataManager:
-    """Manages JSON data files for login tracking"""
 
     @staticmethod
     def read_json_file(file_path: Path) -> List[Dict[str, Any]]:
-        """Safely read JSON data from file"""
+        if not file_path.exists():
+            return []
         try:
-            if not file_path.exists():
-                logger.debug(f"File {file_path} does not exist, returning empty list")
-                return []
-
             with open(file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 return data if isinstance(data, list) else []
-
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON decode error reading {file_path}: {e}")
-            return []
-        except Exception as e:
-            logger.error(f"Error reading {file_path}: {e}")
+        except (json.JSONDecodeError, IOError) as e:
+            logger.error(f"Error reading or parsing JSON from {file_path}: {e}")
             return []
 
     @staticmethod
-    def get_recent_items(data: List[Dict[str, Any]], limit: int = None) -> List[Dict[str, Any]]:
-        """Get most recent items sorted by timestamp"""
-        if limit is None:
-            limit = Config.DEFAULT_RECENT_LIMIT
-
+    def get_recent_items(data: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+        if not data:
+            return []
         try:
             return sorted(
                 data,
@@ -171,185 +209,135 @@ class DataManager:
                 reverse=True
             )[:limit]
         except Exception as e:
-            logger.error(f"Error sorting data: {e}")
-            return data[:limit] if data else []
+            logger.error(f"Failed to sort data for recent items: {e}")
+            # Return a simple slice as a fallback.
+            return data[:limit]
 
     @classmethod
     def get_login_statistics(cls) -> Dict[str, Any]:
-        """Get comprehensive login statistics"""
         try:
             success_data = cls.read_json_file(Config.SUCCESS_FILE)
             failed_data = cls.read_json_file(Config.FAILED_FILE)
             retry_data = cls.read_json_file(Config.RETRY_FILE)
+            limit = Config.DEFAULT_RECENT_LIMIT
+
             return {
                 "success_count": len(success_data),
                 "failed_count": len(failed_data),
                 "retry_count": len(retry_data),
                 "total_attempts": len(success_data) + len(failed_data) + len(retry_data),
-                "latest_success": cls.get_recent_items(success_data),
-                "latest_failures": cls.get_recent_items(failed_data),
-                "latest_retries": cls.get_recent_items(retry_data),
+                "latest_success": cls.get_recent_items(success_data, limit),
+                "latest_failures": cls.get_recent_items(failed_data, limit),
+                "latest_retries": cls.get_recent_items(retry_data, limit),
                 "last_updated": datetime.now().isoformat()
             }
-
         except Exception as e:
-            logger.error(f"Error getting login statistics: {e}")
-            return {
-                "success_count": 0,
-                "failed_count": 0,
-                "retry_count": 0,
-                "total_attempts": 0,
-                "latest_success": [],
-                "latest_failures": [],
-                "latest_retries": [],
-                "last_updated": datetime.now().isoformat(),
-                "error": str(e)
-            }
+            logger.error(f"Error compiling login statistics: {e}", exc_info=True)
+            return {"error": "Failed to retrieve login statistics."}
 
 
 class LogManager:
-    """Manages application logs"""
 
     @staticmethod
-    def get_recent_logs(lines: int = None) -> Dict[str, Any]:
-        """Get recent log entries"""
-        if lines is None:
-            lines = Config.LOG_TAIL_LINES
+    def get_recent_logs(lines: int) -> Dict[str, Any]:
+        log_file = Config.PROCESS_LOG_FILE
+        if not log_file.exists():
+            logger.warning(f"Log file not found: {log_file}")
+            return {"log": "Log file not found.", "lines_count": 0}
 
         try:
-            if not Config.LOG_FILE.exists():
-                logger.warning(f"Log file {Config.LOG_FILE} not found")
-                return {
-                    "log": "Log file not found",
-                    "lines_count": 0,
-                    "file_exists": False
-                }
-
-            with open(Config.LOG_FILE, "r", encoding="utf-8") as f:
-                all_lines = f.readlines()
-                recent_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
-
+            with open(log_file, "r", encoding="utf-8") as f:
+                log_lines = deque(f, lines)
             return {
-                "log": "".join(recent_lines),
-                "lines_count": len(recent_lines),
-                "total_lines": len(all_lines),
-                "file_exists": True
+                "log": "".join(log_lines),
+                "lines_count": len(log_lines)
             }
-
-        except Exception as e:
-            logger.error(f"Error reading log file: {e}")
-            return {
-                "log": f"Error reading log file: {str(e)}",
-                "lines_count": 0,
-                "error": str(e)
-            }
+        except IOError as e:
+            logger.error(f"Error reading log file {log_file}: {e}")
+            return {"log": f"Error reading log file: {e}", "lines_count": 0, "error": str(e)}
 
 
-# Initialize managers
+app = Flask(__name__)
 process_manager = ProcessManager()
 data_manager = DataManager()
 log_manager = LogManager()
 
-# Create Flask app
-app = Flask(__name__)
-
 
 def ensure_directories():
-    """Ensure all required directories exist"""
-    Config.LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    Config.SUCCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    Config.FAILED_FILE.parent.mkdir(parents=True, exist_ok=True)
-    Path('logs').mkdir(exist_ok=True) # For stdout/stderr logs
-
+    try:
+        Config.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        logger.info("Verified that all necessary directories exist.")
+    except Exception as e:
+        logger.critical(f"Could not create necessary directories: {e}", exc_info=True)
+        raise
 
 @app.errorhandler(404)
 def not_found(error):
-    """Handle 404 errors"""
-    return jsonify({
-        "error": "Endpoint not found",
-        "message": "The requested endpoint does not exist"
-    }), 404
-
+    return jsonify({"error": "Not Found", "message": "The requested endpoint does not exist."}), 404
 
 @app.errorhandler(500)
 def internal_error(error):
-    """Handle 500 errors"""
-    logger.error(f"Internal server error: {error}")
-    return jsonify({
-        "error": "Internal server error",
-        "message": "An unexpected error occurred"
-    }), 500
+    logger.error(f"Internal Server Error: {error}", exc_info=True)
+    return jsonify({"error": "Internal Server Error", "message": "An unexpected error occurred on the server."}), 500
 
 
-# API Endpoints
+# --- API Endpoints ---
 @app.route("/status", methods=["GET"])
 def get_status():
-    """Get comprehensive system status including login statistics and process info"""
-    logger.info("Status endpoint called")
+    logger.info("GET /status - Request received")
     try:
         login_stats = data_manager.get_login_statistics()
         process_info = process_manager.get_process_info()
         response = {
-            **login_stats,
-            "process": process_info,
-            "server_status": "healthy"
+            "server_status": "healthy",
+            "process_info": process_info,
+            "login_stats": login_stats,
+            "timestamp": datetime.now().isoformat()
         }
         return jsonify(response)
     except Exception as e:
-        logger.error(f"Error in get_status: {e}", exc_info=True)
-        return jsonify({"error": "Failed to get status", "message": str(e)}), 500
+        logger.error(f"Error in /status endpoint: {e}", exc_info=True)
+        return jsonify({"error": "Failed to retrieve status"}), 500
 
 
-@app.route("/start", methods=["POST", "GET"])
+@app.route("/start", methods=["POST"])
 def start_checker():
-    """Start the checker process"""
-    if request.method == "GET":
-        return jsonify({"message": "To start the checker, send a POST request to this endpoint"})
-
+    logger.info("POST /start - Request received")
     result = process_manager.start()
-    status_code = 200 if result["status"] in ["started", "already_running"] else 400
-    logger.info(f"Start request: {result}")
+    status_code = 200 if result["status"] in [ProcessStatus.STARTED, ProcessStatus.ALREADY_RUNNING] else 400
     return jsonify(result), status_code
 
 
 @app.route("/stop", methods=["POST"])
 def stop_checker():
-    """Stop the checker process"""
+    logger.info("POST /stop - Request received")
     result = process_manager.stop()
-    status_code = 200 if result["status"] in ["stopped", "not_running"] else 400
-    logger.info(f"Stop request: {result}")
+    status_code = 200 if result["status"] in [ProcessStatus.STOPPED, ProcessStatus.NOT_RUNNING] else 400
     return jsonify(result), status_code
-
-
-@app.route("/is_running", methods=["GET"])
-def is_running():
-    """Check if the checker process is running"""
-    return jsonify(process_manager.get_process_info())
 
 
 @app.route("/log", methods=["GET"])
 def get_log():
-    """Get recent log entries"""
+    logger.info("GET /log - Request received")
     try:
-        lines = request.args.get('lines', type=int)
+        lines_str = request.args.get('lines', str(Config.LOG_TAIL_LINES))
+        if not lines_str.isdigit() or int(lines_str) <= 0:
+            return jsonify({"error": "Invalid 'lines' parameter. Must be a positive integer."}), 400
+
+        lines = int(lines_str)
         log_data = log_manager.get_recent_logs(lines)
         return jsonify(log_data)
     except Exception as e:
-        logger.error(f"Error in get_log: {e}")
-        return jsonify({"log": f"Error retrieving logs: {str(e)}", "error": str(e)}), 500
+        logger.error(f"Error in /log endpoint: {e}", exc_info=True)
+        return jsonify({"error": f"Failed to retrieve logs: {e}"}), 500
 
 
+# --- Main Execution ---
 if __name__ == "__main__":
     ensure_directories()
-    logger.info("Starting BasoKa Flask Reporter Server (Simplified Version)")
-
     try:
-        app.run(
-            host="0.0.0.0",
-            port=8000,
-            debug=True,
-            threaded=True # Flask's threaded=True is fine, it handles requests in threads
-        )
+        app.run(host="0.0.0.0", port=8000, debug=False, threaded=True)
     except Exception as e:
-        logger.error(f"Failed to start Flask server: {e}")
-        raise
+        logger.critical(f"Failed to start Flask server: {e}", exc_info=True)
+        sys.exit(1)

@@ -9,6 +9,7 @@ dependencies = [
     "requests>=2.31.0",
     "python-dotenv>=1.0.0",
     "selenium>=4.15.0",
+    "psutil>=7.0.0",
 ]
 
 [project.optional-dependencies]
