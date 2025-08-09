@@ -9,9 +9,10 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional
 from collections import deque
 import psutil
+import zipfile
 
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 
 # --- Basic Setup ---
 # Determine the absolute path of the project's root directory.
@@ -321,13 +322,21 @@ def stop_checker():
 def get_log():
     logger.info("GET /log - Request received")
     try:
-        lines_str = request.args.get('lines', str(Config.LOG_TAIL_LINES))
-        if not lines_str.isdigit() or int(lines_str) <= 0:
-            return jsonify({"error": "Invalid 'lines' parameter. Must be a positive integer."}), 400
+        # Create a temporary zip file to bundle the requested files
+        zip_path = LOGS_DIR / "log_bundle.zip"
+        with zipfile.ZipFile(zip_path, 'w') as zipf:
+            # Add the required files to the zip
+            if Config.FAILED_FILE.exists():
+                zipf.write(Config.FAILED_FILE, arcname="failed_logins.json")
+            if Config.RETRY_FILE.exists():
+                zipf.write(Config.RETRY_FILE, arcname="retry_accounts.json")
+            if Config.PROCESS_LOG_FILE.exists():
+                zipf.write(Config.PROCESS_LOG_FILE, arcname="login_process.log")
+            if Config.SUCCESS_FILE.exists():
+                zipf.write(Config.SUCCESS_FILE, arcname="successful_logins.json")
+        # Send the zip file as a response
+        return send_file(zip_path, as_attachment=True, download_name="log_bundle.zip")
 
-        lines = int(lines_str)
-        log_data = log_manager.get_recent_logs(lines)
-        return jsonify(log_data)
     except Exception as e:
         logger.error(f"Error in /log endpoint: {e}", exc_info=True)
         return jsonify({"error": f"Failed to retrieve logs: {e}"}), 500
